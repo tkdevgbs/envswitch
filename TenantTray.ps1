@@ -42,6 +42,8 @@ if ($consoleWnd -ne [IntPtr]::Zero) { [void][Win32.Native]::ShowWindow($consoleW
 $TaskName   = 'iQSuiteTenantTray'
 $ScriptPath = $MyInvocation.MyCommand.Path
 $SwitchScript = Join-Path (Split-Path $ScriptPath) 'Switch-iQSuiteTenantMode.ps1'
+$FrontendScript = Join-Path (Split-Path $ScriptPath) 'Switch-iQSuiteFrontend.ps1'
+$FrontendCommon = Join-Path (Split-Path $ScriptPath) 'iQSuiteFrontend.Common.ps1'
 $LogPath    = Join-Path (Split-Path $ScriptPath) 'TenantTray.log'
 
 function Test-IsAdministrator {
@@ -56,6 +58,7 @@ function Test-IsAdministrator {
     elevated, so such write access would allow privilege escalation.
 #>
 function Get-InsecureWriteAccess {
+    param([string[]]$Paths = @((Split-Path $ScriptPath), $ScriptPath, $SwitchScript, $FrontendScript, $FrontendCommon, $LogPath))
     $trusted = @(
         'S-1-5-18',                                                       # SYSTEM
         'S-1-5-32-544',                                                   # Administrators
@@ -67,8 +70,7 @@ function Get-InsecureWriteAccess {
     # WriteAttributes, Delete, WRITE_DAC, WRITE_OWNER, GENERIC_ALL, GENERIC_WRITE
     $writeMask = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
 
-    $paths = @((Split-Path $ScriptPath), $ScriptPath, $SwitchScript, $LogPath) |
-        Where-Object { Test-Path -LiteralPath $_ }
+    $paths = @($Paths) | Where-Object { Test-Path -LiteralPath $_ }
     $findings = @()
     foreach ($path in $paths) {
         try { $acl = Get-Acl -LiteralPath $path }
@@ -149,6 +151,14 @@ function Get-TenantState {
     catch { [PSCustomObject]@{ Mode = 'Unknown'; Detail = $_.Exception.Message } }
 }
 
+# --- Frontend (Dev / Installed COM registration) - shared with Switch-iQSuiteFrontend.ps1 ---
+. $FrontendCommon
+
+function Get-SafeFrontendState {
+    try { Get-FrontendState }
+    catch { [PSCustomObject]@{ Mode = 'Mixed'; Detail = $_.Exception.Message } }
+}
+
 # --- UI ---
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
@@ -156,7 +166,21 @@ $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, 'Local\iQSuiteTenantTray', [ref]$createdNew)
 if (-not $createdNew) { return }
 
-function New-TrayIcon([string]$Text, [System.Drawing.Color]$Color) {
+$TenantColors = @{
+    Multi   = [System.Drawing.Color]::RoyalBlue
+    Single  = [System.Drawing.Color]::SeaGreen
+    Unknown = [System.Drawing.Color]::Firebrick
+    Busy    = [System.Drawing.Color]::DarkOrange
+}
+$TenantLetters = @{ Multi = 'M'; Single = 'S'; Unknown = '?'; Busy = [string][char]0x2026 }
+# Small badge in the lower right corner for the frontend variant (none = Installed)
+$FrontendBadges = @{
+    Dev   = [System.Drawing.Color]::Gold
+    Mixed = [System.Drawing.Color]::Red
+    None  = [System.Drawing.Color]::Red
+}
+
+function New-TrayIcon([string]$Text, [System.Drawing.Color]$Color, $BadgeColor) {
     $bmp = New-Object System.Drawing.Bitmap 32, 32
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = 'AntiAlias'
@@ -166,75 +190,92 @@ function New-TrayIcon([string]$Text, [System.Drawing.Color]$Color) {
     $sf = New-Object System.Drawing.StringFormat
     $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
     $g.DrawString($Text, $font, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF 0, 1, 32, 32), $sf)
+    if ($null -ne $BadgeColor) {
+        $g.FillEllipse([System.Drawing.Brushes]::White, 17, 17, 15, 15)
+        $g.FillEllipse((New-Object System.Drawing.SolidBrush $BadgeColor), 19, 19, 11, 11)
+    }
     $g.Dispose()
     $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
     $icon
 }
 
-$icons = @{
-    Multi   = New-TrayIcon 'M' ([System.Drawing.Color]::RoyalBlue)
-    Single  = New-TrayIcon 'S' ([System.Drawing.Color]::SeaGreen)
-    Unknown = New-TrayIcon '?' ([System.Drawing.Color]::Firebrick)
-    Busy    = New-TrayIcon ([string][char]0x2026) ([System.Drawing.Color]::DarkOrange)
+$iconCache = @{}
+function Get-TrayIcon([string]$TenantKey, [string]$FrontendMode) {
+    $key = "$TenantKey|$FrontendMode"
+    if (-not $iconCache.ContainsKey($key)) {
+        $badge = if ($FrontendBadges.ContainsKey($FrontendMode)) { $FrontendBadges[$FrontendMode] } else { $null }
+        $iconCache[$key] = New-TrayIcon $TenantLetters[$TenantKey] $TenantColors[$TenantKey] $badge
+    }
+    $iconCache[$key]
 }
 
-$script:switchProc = $null
-$script:switchTarget = $null
+# Running switch: @{ Proc; Kind = 'Tenant' | 'Frontend'; Target }
+$script:job = $null
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Visible = $true
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $miStatus = $menu.Items.Add('Status: ...'); $miStatus.Enabled = $false
+$miFeStatus = $menu.Items.Add('Frontend: ...'); $miFeStatus.Enabled = $false
 $null = $menu.Items.Add('-')
 $miSingle = $menu.Items.Add('Switch to SingleTenant')
 $miMulti  = $menu.Items.Add('Switch to MultiTenant')
+$null = $menu.Items.Add('-')
+$miFeInstalled = $menu.Items.Add('Switch frontend to Installed')
+$miFeDev       = $menu.Items.Add('Switch frontend to Dev')
 $null = $menu.Items.Add('-')
 $miLog  = $menu.Items.Add('Open log')
 $miExit = $menu.Items.Add('Exit')
 $notify.ContextMenuStrip = $menu
 
-function Update-Ui {
-    $busy = $null -ne $script:switchProc
-    $state = Get-TenantState
-    if ($busy) {
-        $notify.Icon = $icons.Busy
-        $text = "Switching to $($script:switchTarget)Tenant ..."
-    }
-    else {
-        $notify.Icon = $icons[$state.Mode]
-        $text = if ($state.Mode -eq 'Unknown') { "iQ.Suite: inconsistent ($($state.Detail))" } else { "iQ.Suite: $($state.Mode)Tenant" }
-    }
-    $miStatus.Text = $text
-    $notify.Text = $text.Substring(0, [Math]::Min(63, $text.Length))
-    $miSingle.Enabled = -not $busy -and $state.Mode -eq 'Multi'
-    $miMulti.Enabled  = -not $busy -and $state.Mode -eq 'Single'
+function Get-JobText {
+    if ($script:job.Kind -eq 'Tenant') { "Switching to $($script:job.Target)Tenant ..." }
+    else { "Switching frontend to $($script:job.Target) ..." }
 }
 
-function Start-Switch([string]$Target) {
-    if ($script:switchProc) { return }
-    $answer = [System.Windows.Forms.MessageBox]::Show(
-        "Switch iQ.Suite to ${Target}Tenant?`nServices are stopped and IIS is reset (can take about a minute).",
-        $AppName, 'YesNo', 'Question')
-    if ($answer -ne 'Yes') { return }
+function Update-Ui {
+    $busy = $null -ne $script:job
+    $state = Get-TenantState
+    $fe = Get-SafeFrontendState
 
-    # The switch script runs elevated - refuse if non-admins could have tampered with it.
-    $insecure = Get-InsecureWriteAccess
-    if ($insecure.Count -gt 0) {
-        [void][System.Windows.Forms.MessageBox]::Show(
-            "Switch NOT started: non-admin users can modify the script folder, so running it elevated is unsafe.`n`n" +
-            ($insecure -join "`n") + "`n`nRestrict write access to administrators (see README).",
-            $AppName, 'OK', 'Warning')
-        return
+    $text = if ($state.Mode -eq 'Unknown') { "iQ.Suite: inconsistent ($($state.Detail))" } else { "iQ.Suite: $($state.Mode)Tenant" }
+    $feText = switch ($fe.Mode) {
+        'Dev'       { "Frontend: Dev ($FrontendRepoRoot)" }
+        'Installed' { 'Frontend: Installed' }
+        'None'      { 'Frontend: not registered' }
+        default     { "Frontend: mixed ($($fe.Detail))" }
     }
+    if ($feText.Length -gt 110) { $feText = $feText.Substring(0, 107) + '...' }
+    $miStatus.Text = $text
+    $miFeStatus.Text = $feText
 
-    $cmd = "& '$SwitchScript' -Set${Target}Tenant -Force *> '$LogPath'; exit `$LASTEXITCODE"
+    if ($busy) {
+        $notify.Icon = Get-TrayIcon 'Busy' $fe.Mode
+        $tip = Get-JobText
+    }
+    else {
+        $notify.Icon = Get-TrayIcon $state.Mode $fe.Mode
+        $tenantShort = if ($state.Mode -eq 'Unknown') { 'inconsistent' } else { "$($state.Mode)Tenant" }
+        $tip = "iQ.Suite: $tenantShort | Frontend: $($fe.Mode)"
+    }
+    $notify.Text = $tip.Substring(0, [Math]::Min(63, $tip.Length))
+
+    $miSingle.Enabled      = -not $busy -and $state.Mode -eq 'Multi'
+    $miMulti.Enabled       = -not $busy -and $state.Mode -eq 'Single'
+    $miFeInstalled.Enabled = -not $busy -and $fe.Mode -ne 'Installed'
+    $miFeDev.Enabled       = -not $busy -and $fe.Mode -ne 'Dev' -and (Test-Path -LiteralPath $FrontendDevRoot)
+}
+
+<# Starts a switch script elevated in the background, output goes to the log. #>
+function Start-SwitchJob([string]$Kind, [string]$Target, [string]$ScriptFile, [string]$Arguments) {
+    $cmd = "& '$ScriptFile' $Arguments -Force *> '$LogPath'; exit `$LASTEXITCODE"
     $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $cmd)
     try {
         $sp = @{ FilePath = 'powershell.exe'; ArgumentList = $psArgs; PassThru = $true; WindowStyle = 'Hidden' }
         if (-not (Test-IsAdministrator)) { $sp.Verb = 'RunAs' }
-        $script:switchProc = Start-Process @sp
-        $script:switchTarget = $Target
+        $proc = Start-Process @sp
+        $script:job = @{ Proc = $proc; Kind = $Kind; Target = $Target }
     }
     catch {
         $notify.ShowBalloonTip(5000, $AppName, "Switch not started: $($_.Exception.Message)", 'Warning')
@@ -242,8 +283,56 @@ function Start-Switch([string]$Target) {
     Update-Ui
 }
 
+<# The switch scripts run elevated - refuse if non-admins could have tampered with them. #>
+function Test-ScriptFolderSecure {
+    $insecure = Get-InsecureWriteAccess
+    if ($insecure.Count -eq 0) { return $true }
+    [void][System.Windows.Forms.MessageBox]::Show(
+        "Switch NOT started: non-admin users can modify the script folder, so running it elevated is unsafe.`n`n" +
+        ($insecure -join "`n") + "`n`nRestrict write access to administrators (see README).",
+        $AppName, 'OK', 'Warning')
+    $false
+}
+
+function Start-Switch([string]$Target) {
+    if ($script:job) { return }
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        "Switch iQ.Suite to ${Target}Tenant?`nServices are stopped and IIS is reset (can take about a minute).",
+        $AppName, 'YesNo', 'Question')
+    if ($answer -ne 'Yes') { return }
+    if (-not (Test-ScriptFolderSecure)) { return }
+    Start-SwitchJob 'Tenant' $Target $SwitchScript "-Set${Target}Tenant"
+}
+
+function Start-FrontendSwitch([string]$Target) {
+    if ($script:job) { return }
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        "Switch the iQ.Suite frontend (MMC) to '$Target'?`n`n" +
+        "The other variant is unregistered, then '$Target' is registered (regsvr32 / RegAsm).`n" +
+        "MMC and VB6 must be closed.",
+        $AppName, 'YesNo', 'Question')
+    if ($answer -ne 'Yes') { return }
+    if (-not (Test-ScriptFolderSecure)) { return }
+
+    # Both directions run DllRegisterServer/DllUnregisterServer of the Dev DLLs elevated.
+    # The repo is a dev working copy, so this only warns (by design) instead of refusing.
+    $insecure = Get-InsecureWriteAccess -Paths (Get-FrontendDevFolders)
+    if ($insecure.Count -gt 0) {
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "Warning: non-admin users can modify the Dev frontend DLLs, which are executed elevated during the switch:`n`n" +
+            (($insecure | Select-Object -First 5) -join "`n") + "`n`nContinue anyway?",
+            $AppName, 'YesNo', 'Warning')
+        if ($answer -ne 'Yes') { return }
+    }
+
+    $arguments = "-Set$Target -RepoRoot '$FrontendRepoRoot'"
+    Start-SwitchJob 'Frontend' $Target $FrontendScript $arguments
+}
+
 $miSingle.add_Click({ Start-Switch 'Single' })
 $miMulti.add_Click({ Start-Switch 'Multi' })
+$miFeInstalled.add_Click({ Start-FrontendSwitch 'Installed' })
+$miFeDev.add_Click({ Start-FrontendSwitch 'Dev' })
 $miLog.add_Click({ if (Test-Path $LogPath) { Start-Process notepad.exe $LogPath } })
 $miExit.add_Click({
     $timer.Stop(); $notify.Visible = $false; $notify.Dispose()
@@ -259,12 +348,16 @@ $notify.add_MouseClick({
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = [Math]::Max(1, $PollSeconds) * 1000
 $timer.add_Tick({
-    if ($script:switchProc -and $script:switchProc.HasExited) {
-        $code = $script:switchProc.ExitCode
-        $target = $script:switchTarget
-        $script:switchProc = $null
-        if ($code -eq 0) { $notify.ShowBalloonTip(4000, $AppName, "Switched to ${target}Tenant.", 'Info') }
-        else { $notify.ShowBalloonTip(8000, $AppName, "Switch failed (exit code $code). See TenantTray.log.", 'Error') }
+    if ($script:job -and $script:job.Proc.HasExited) {
+        $code = $script:job.Proc.ExitCode
+        $kind = $script:job.Kind
+        $done = if ($script:job.Kind -eq 'Tenant') { "Switched to $($script:job.Target)Tenant." } else { "Frontend switched to $($script:job.Target)." }
+        $script:job = $null
+        if ($code -eq 0) { $notify.ShowBalloonTip(4000, $AppName, $done, 'Info') }
+        else {
+            $hint = if ($code -eq 5 -and $kind -eq 'Frontend') { 'Close MMC / VB6 first.' } else { 'See TenantTray.log.' }
+            $notify.ShowBalloonTip(8000, $AppName, "Switch failed (exit code $code). $hint", 'Error')
+        }
     }
     Update-Ui
 })
