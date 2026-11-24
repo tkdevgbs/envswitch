@@ -43,6 +43,18 @@
     Skips the confirmation prompt before switching. Does NOT skip the
     consistency/validation check.
 
+.NOTES
+    Exit codes:
+      0  OK (status consistent / switch done / already in target mode / aborted by user)
+      1  Not administrator or invalid arguments
+      2  Inconsistent state (nothing changed)
+      3  Pre-check failed, e.g. backup file missing (nothing changed)
+      4  Switch done, but the state afterwards is not consistent
+      5  Services could not be stopped (nothing changed, services restarted)
+      6  Error while swapping files/registry, rolled back
+      7  Switch done, but a service could not be (re)started
+      8  Stale lock file could not be removed (nothing changed, services restarted)
+
 .EXAMPLE
     .\Switch-iQSuiteTenantMode.ps1
     Shows the current status only.
@@ -631,7 +643,16 @@ function Invoke-TenantSwitch {
 
     # --- 2. Remove stale lock files ---
     Write-Host '2. Removing stale lock files ...' -ForegroundColor Cyan
-    Remove-StaleLockFiles
+    try {
+        Remove-StaleLockFiles
+    }
+    catch {
+        Write-Host "ERROR: Could not remove lock file: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host 'Another process probably still holds it. No files or registry values were changed.' -ForegroundColor Red
+        Write-Host 'Starting the previously running services again ...' -ForegroundColor Red
+        [void](Start-IQSuiteServices -Names $previouslyRunning)
+        exit 8
+    }
 
     # --- 3.-5. Swap files and set registry (with rollback) ---
     $journal = New-Object 'System.Collections.Generic.List[object]'
@@ -715,13 +736,16 @@ function Invoke-TenantSwitch {
     $newStatus = Get-OverallTenantStatus
     Write-TenantStatusReport -Status $newStatus
 
+    if ($failedServices.Count -gt 0) {
+        Write-Host "WARNING: The following services could not be (re)started: $($failedServices -join ', ')" -ForegroundColor Yellow
+    }
+
     if (-not ($newStatus.IsConsistent -and $newStatus.OverallMode -eq $TargetMode)) {
         Write-Host 'WARNING: After the switch, the state is not consistent as expected. Please check manually.' -ForegroundColor Red
         exit 4
     }
 
     if ($failedServices.Count -gt 0) {
-        Write-Host "WARNING: The following services could not be (re)started: $($failedServices -join ', ')" -ForegroundColor Yellow
         exit 7
     }
 

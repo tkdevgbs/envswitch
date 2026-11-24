@@ -49,8 +49,58 @@ function Test-IsAdministrator {
     $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+<#
+    Returns a description of every ACL entry that lets someone other than
+    SYSTEM, Administrators, TrustedInstaller or the current user modify the
+    script folder, the scripts or the log. These files are executed / written
+    elevated, so such write access would allow privilege escalation.
+#>
+function Get-InsecureWriteAccess {
+    $trusted = @(
+        'S-1-5-18',                                                       # SYSTEM
+        'S-1-5-32-544',                                                   # Administrators
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464', # TrustedInstaller
+        'S-1-3-0',                                                        # CREATOR OWNER (inherit-only)
+        [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    )
+    # WriteData/CreateFiles, AppendData/CreateDirectories, WriteEA, DeleteChild,
+    # WriteAttributes, Delete, WRITE_DAC, WRITE_OWNER, GENERIC_ALL, GENERIC_WRITE
+    $writeMask = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+
+    $paths = @((Split-Path $ScriptPath), $ScriptPath, $SwitchScript, $LogPath) |
+        Where-Object { Test-Path -LiteralPath $_ }
+    $findings = @()
+    foreach ($path in $paths) {
+        try { $acl = Get-Acl -LiteralPath $path }
+        catch {
+            $findings += "$path : ACL could not be read ($($_.Exception.Message))"
+            continue
+        }
+        foreach ($ace in $acl.Access) {
+            if ($ace.AccessControlType -ne 'Allow') { continue }
+            if ($ace.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+            if (([int64]$ace.FileSystemRights -band $writeMask) -eq 0) { continue }
+            try { $sid = $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+            catch { $sid = $ace.IdentityReference.Value }
+            if ($trusted -notcontains $sid) {
+                $findings += "$path : $($ace.IdentityReference) ($($ace.FileSystemRights))"
+            }
+        }
+    }
+    , $findings
+}
+
 if ($InstallAutostart -or $UninstallAutostart) {
     if (-not (Test-IsAdministrator)) { throw 'Administrator rights required.' }
+    if ($InstallAutostart) {
+        $insecure = Get-InsecureWriteAccess
+        if ($insecure.Count -gt 0) {
+            throw ("Refusing to register an elevated autostart task: non-admin principals can modify the scripts, " +
+                "which would let them run code as administrator. Restrict write access first, e.g.:`n" +
+                "  icacls `"$(Split-Path $ScriptPath)`" /inheritance:d /remove:g *S-1-5-32-545 /grant *S-1-5-32-545:(OI)(CI)RX`n" +
+                "Offending entries:`n  " + ($insecure -join "`n  "))
+        }
+    }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     if ($InstallAutostart) {
         $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
@@ -168,10 +218,20 @@ function Start-Switch([string]$Target) {
         $AppName, 'YesNo', 'Question')
     if ($answer -ne 'Yes') { return }
 
+    # The switch script runs elevated - refuse if non-admins could have tampered with it.
+    $insecure = Get-InsecureWriteAccess
+    if ($insecure.Count -gt 0) {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "Switch NOT started: non-admin users can modify the script folder, so running it elevated is unsafe.`n`n" +
+            ($insecure -join "`n") + "`n`nRestrict write access to administrators (see README).",
+            $AppName, 'OK', 'Warning')
+        return
+    }
+
     $cmd = "& '$SwitchScript' -Set${Target}Tenant -Force *> '$LogPath'; exit `$LASTEXITCODE"
-    $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $cmd)
+    $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $cmd)
     try {
-        $sp = @{ FilePath = 'powershell.exe'; ArgumentList = $args; PassThru = $true; WindowStyle = 'Hidden' }
+        $sp = @{ FilePath = 'powershell.exe'; ArgumentList = $psArgs; PassThru = $true; WindowStyle = 'Hidden' }
         if (-not (Test-IsAdministrator)) { $sp.Verb = 'RunAs' }
         $script:switchProc = Start-Process @sp
         $script:switchTarget = $Target

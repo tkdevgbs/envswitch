@@ -49,7 +49,19 @@ A switch validates everything first, then: stops the services → removes stale 
 .\Switch-iQSuiteTenantMode.ps1 -SetMultiTenant -Force   # switch without prompt
 ```
 
-Exit codes: `0` ok, `1` not admin / bad arguments, `2` inconsistent state, `4` state wrong after switch, `7` a service could not be started.
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0` | OK (or already in target mode / aborted by user) |
+| `1` | Not administrator / bad arguments |
+| `2` | Inconsistent state – nothing changed |
+| `3` | Pre-check failed (e.g. backup file missing) – nothing changed |
+| `4` | Switch done, but state afterwards not consistent |
+| `5` | Services could not be stopped – nothing changed, services restarted |
+| `6` | Error while swapping files/registry – rolled back |
+| `7` | Switch done, but a service could not be (re)started |
+| `8` | Stale lock file could not be removed – nothing changed, services restarted |
 
 ## Running the tray app
 
@@ -64,6 +76,12 @@ Only one instance can run at a time. If you start it directly in a PowerShell wi
 ## Autostart (recommended)
 
 The autostart is a **scheduled task** that starts the tray at logon **with highest privileges**. Because the tray then already runs elevated, switching does **not** trigger a UAC prompt.
+
+> **Security:** the task and the switch run elevated, so the script folder must only be writable by administrators (and you). Otherwise any local user could edit the scripts and have them run as admin. `-InstallAutostart` and the tray's switch menu refuse to run if they detect non-admin write access. To lock down the folder (as Administrator):
+>
+> ```powershell
+> icacls D:\envswitch /inheritance:d /remove:g *S-1-5-32-545 /grant *S-1-5-32-545:(OI)(CI)RX
+> ```
 
 Open PowerShell **as Administrator** in the repo folder:
 
